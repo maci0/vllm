@@ -29,9 +29,6 @@ _NCCL_SYMM_OPS_REGISTERED = False
 
 
 def register_nccl_symmetric_ops(pynccl_comm):
-    from vllm.distributed.device_communicators.pynccl_allocator import (
-        nccl_symm_mem_context,
-    )
     from vllm.utils.torch_utils import direct_register_custom_op
 
     global _NCCL_SYMM_OPS_REGISTERED
@@ -40,12 +37,18 @@ def register_nccl_symmetric_ops(pynccl_comm):
     _NCCL_SYMM_OPS_REGISTERED = True
 
     def all_reduce_symmetric_with_copy_impl(input_tensor: torch.Tensor) -> torch.Tensor:
-        with nccl_symm_mem_context(pynccl_comm):
-            symm_input = torch.empty_like(input_tensor)
-            symm_output = torch.empty_like(input_tensor)
+        # Persistent registered scratch (sized in warmup) so the captured hot
+        # path never allocates/registers a new NCCL window -> CUDA-graph safe.
+        symm_input = pynccl_comm.get_symm_scratch(
+            "ar_in", input_tensor.numel(), input_tensor.dtype, input_tensor.device
+        ).view(input_tensor.shape)
+        symm_output = pynccl_comm.get_symm_scratch(
+            "ar_out", input_tensor.numel(), input_tensor.dtype, input_tensor.device
+        ).view(input_tensor.shape)
         symm_input.copy_(input_tensor)
-        symm_output = pynccl_comm.all_reduce(symm_input, symm_output)
-        return symm_output
+        pynccl_comm.all_reduce(symm_input, symm_output)
+        # Copy out of the reused scratch into a normally-managed tensor.
+        return symm_output.clone()
 
     def all_reduce_symmetric_with_copy_fake(input_tensor: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(input_tensor)
@@ -54,6 +57,78 @@ def register_nccl_symmetric_ops(pynccl_comm):
         op_name="all_reduce_symmetric_with_copy",
         op_func=all_reduce_symmetric_with_copy_impl,
         fake_impl=all_reduce_symmetric_with_copy_fake,
+    )
+
+    # Symmetric-memory (NVLS multicast) reduce_scatter / all_gather along dim 0.
+    # Routes NCCL to the ncclSymk LDMC/STMC kernels instead of generic RING.
+    def reduce_scatter_symmetric_with_copy_impl(
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        ws = pynccl_comm.world_size
+        chunk = input_tensor.shape[0] // ws
+        out_shape = (chunk, *input_tensor.shape[1:])
+        symm_input = pynccl_comm.get_symm_scratch(
+            "rs_in", input_tensor.numel(), input_tensor.dtype, input_tensor.device
+        ).view(input_tensor.shape)
+        symm_output = pynccl_comm.get_symm_scratch(
+            "rs_out",
+            input_tensor.numel() // ws,
+            input_tensor.dtype,
+            input_tensor.device,
+        ).view(out_shape)
+        symm_input.copy_(input_tensor)
+        pynccl_comm.reduce_scatter(symm_output, symm_input)
+        # Copy out of the symmetric scratch so the result is a normally-managed
+        # tensor (the scratch is reused by the next call).
+        return symm_output.clone()
+
+    def reduce_scatter_symmetric_with_copy_fake(
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        chunk = input_tensor.shape[0] // pynccl_comm.world_size
+        return torch.empty(
+            (chunk, *input_tensor.shape[1:]),
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+        )
+
+    direct_register_custom_op(
+        op_name="reduce_scatter_symmetric_with_copy",
+        op_func=reduce_scatter_symmetric_with_copy_impl,
+        fake_impl=reduce_scatter_symmetric_with_copy_fake,
+    )
+
+    def all_gather_symmetric_with_copy_impl(
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        ws = pynccl_comm.world_size
+        out_shape = (input_tensor.shape[0] * ws, *input_tensor.shape[1:])
+        symm_input = pynccl_comm.get_symm_scratch(
+            "ag_in", input_tensor.numel(), input_tensor.dtype, input_tensor.device
+        ).view(input_tensor.shape)
+        symm_output = pynccl_comm.get_symm_scratch(
+            "ag_out",
+            input_tensor.numel() * ws,
+            input_tensor.dtype,
+            input_tensor.device,
+        ).view(out_shape)
+        symm_input.copy_(input_tensor)
+        pynccl_comm.all_gather(symm_output, symm_input)
+        return symm_output.clone()
+
+    def all_gather_symmetric_with_copy_fake(
+        input_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (input_tensor.shape[0] * pynccl_comm.world_size, *input_tensor.shape[1:]),
+            dtype=input_tensor.dtype,
+            device=input_tensor.device,
+        )
+
+    direct_register_custom_op(
+        op_name="all_gather_symmetric_with_copy",
+        op_func=all_gather_symmetric_with_copy_impl,
+        fake_impl=all_gather_symmetric_with_copy_fake,
     )
 
 
@@ -88,6 +163,12 @@ class PyNcclCommunicator:
             self.world_size = group.world_size
 
         self.group = group
+
+        # Persistent symmetric-memory scratch buffers for reduce_scatter /
+        # all_gather. Allocated + NCCL-window-registered once (during eager
+        # warmup) and reused as slices, so the capturable hot path never
+        # allocates or registers (which would invalidate CUDA graph capture).
+        self._symm_scratch_bufs: dict[tuple[str, torch.dtype], torch.Tensor] = {}
 
         # if world_size == 1, no need to create communicator
         if self.world_size == 1 or envs.VLLM_DISABLE_PYNCCL:
@@ -162,6 +243,28 @@ class PyNcclCommunicator:
             abort_thread.join(timeout=5.0)
             self.available = False
             self.disabled = True
+
+    def get_symm_scratch(
+        self, name: str, numel: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """A persistent, NCCL-window-registered scratch buffer of >= numel
+        elements. (Re)allocated lazily and only when not capturing, so the
+        captured hot path reuses an already-registered window."""
+        from vllm.distributed.device_communicators.pynccl_allocator import (
+            nccl_symm_mem_context,
+        )
+
+        key = (name, dtype)
+        buf = self._symm_scratch_bufs.get(key)
+        if buf is None or buf.numel() < numel:
+            assert not torch.cuda.is_current_stream_capturing(), (
+                "symmetric-memory scratch must be sized during warmup, "
+                "before CUDA graph capture"
+            )
+            with nccl_symm_mem_context(self):
+                buf = torch.empty(numel, dtype=dtype, device=device)
+            self._symm_scratch_bufs[key] = buf
+        return buf[:numel]
 
     def all_reduce(
         self,

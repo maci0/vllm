@@ -310,6 +310,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if dim < 0:
+            dim += input_.dim()
+        # Symmetric-memory (NVLS multicast) all_gather for the dim-0 case.
+        if (
+            dim == 0
+            and is_symmetric_memory_enabled()
+            and self.pynccl_comm is not None
+            and not self.pynccl_comm.disabled
+        ):
+            out = torch.ops.vllm.all_gather_symmetric_with_copy(input_.contiguous())
+            if out is not None:
+                return out
+        return super().all_gather(input_, dim)
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
@@ -323,6 +338,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         input_tensor = input_.movedim(0, dim).contiguous()
 
         assert input_tensor.shape[0] % world_size == 0
+
+        # Symmetric-memory (NVLS multicast) reduce_scatter for the dim-0 case.
+        if is_symmetric_memory_enabled():
+            output = torch.ops.vllm.reduce_scatter_symmetric_with_copy(input_tensor)
+            if output is not None:
+                return output.movedim(0, dim).contiguous()
+
         chunk_size = input_tensor.shape[0] // world_size
         output_shape = (chunk_size,) + input_tensor.shape[1:]
 
