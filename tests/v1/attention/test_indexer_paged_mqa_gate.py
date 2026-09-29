@@ -10,7 +10,8 @@ assert inside ``DeepseekV32IndexerMetadataBuilder.build()``.
 
 ``_should_build_paged_mqa_logits_metadata`` is covered directly elsewhere; these
 tests pin the behaviour at the call site, which is the only place the bad value
-can reach the kernel.
+can reach the kernel. When the gate skips, ``build()`` still returns the
+preallocated schedule buffer, so that buffer must be zero.
 """
 
 import pytest
@@ -107,6 +108,43 @@ def test_decode_build_survives_compress_128_on_device(tokens_per_state):
 
     assert metadata.decode is not None
     assert metadata.decode.schedule_metadata.shape[1] == 2
+
+
+@pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the indexer decode path is CUDA only"
+)
+def test_decode_build_skip_path_returns_zeroed_schedule(monkeypatch):
+    """A skipped page must hand back zeros, not stale allocator memory.
+
+    Fresh CUDA memory in a new process is usually already zero, which would hide
+    a ``torch.empty`` buffer, so the small pool is first filled with a sentinel
+    and released before the builder allocates.
+    """
+    device = torch.device("cuda")
+    spec = _make_spec(C128_TOKENS_PER_STATE)
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        indexer,
+        "get_paged_mqa_logits_metadata",
+        lambda seq_lens, num_states, num_sms, indices=None: calls.append(num_states),
+    )
+    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: True, raising=False)
+
+    sentinel = [
+        torch.full((1 << 18,), 12345, dtype=torch.int32, device=device)
+        for _ in range(16)
+    ]
+    torch.cuda.synchronize()
+    del sentinel
+
+    builder = _build_builder(spec, device)
+    for _ in range(2):
+        metadata = builder.build(0, _decode_only_metadata(device))
+        schedule = metadata.decode.schedule_metadata
+        assert schedule.data_ptr() == builder.scheduler_metadata_buffer.data_ptr()
+        assert schedule.count_nonzero().item() == 0
+    assert calls == []
 
 
 def _build_builder(spec: MLAAttentionSpec, device: torch.device):
