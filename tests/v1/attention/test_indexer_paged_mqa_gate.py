@@ -88,6 +88,45 @@ def test_decode_build_skips_deep_gemm_for_two_state_pages(
 
 
 @pytest.mark.skipif(
+    not current_platform.is_cuda(), reason="the indexer decode path is CUDA only"
+)
+@pytest.mark.parametrize(
+    "tokens_per_state,expect_deep_gemm_call",
+    [(C4A_TOKENS_PER_STATE, True), (C128_TOKENS_PER_STATE, False)],
+)
+def test_draft_decode_update_skips_deep_gemm_for_two_state_pages(
+    monkeypatch, tokens_per_state, expect_deep_gemm_call
+):
+    """The draft-decode path must respect the gate too.
+
+    ``update_draft_decode_metadata`` re-derives the paged-MQA schedule
+    metadata for fused multi-step decode; the site was added after this
+    PR's original base and is gated by the same predicate. The DeepGEMM
+    entry point is stubbed; ``build()``'s own gated call is pinned by
+    ``test_decode_build_skips_deep_gemm_for_two_state_pages``, so the
+    recorder is cleared between the two paths.
+    """
+    device = torch.device("cuda")
+    spec = _make_spec(tokens_per_state)
+
+    calls: list[int] = []
+
+    def _record(seq_lens, num_states, num_sms, indices=None):
+        calls.append(num_states)
+        return torch.zeros((num_sms + 1, 2), dtype=torch.int32, device=seq_lens.device)
+
+    monkeypatch.setattr(indexer, "get_paged_mqa_logits_metadata", _record)
+    monkeypatch.setattr(indexer, "is_deep_gemm_supported", lambda: True, raising=False)
+
+    builder = _build_builder(spec, device)
+    metadata = builder.build(0, _decode_only_metadata(device))
+    calls.clear()
+    builder.update_draft_decode_metadata(metadata)
+
+    assert calls == ([spec.num_states] if expect_deep_gemm_call else [])
+
+
+@pytest.mark.skipif(
     not current_platform.is_cuda(), reason="DeepGEMM paged MQA metadata is CUDA only"
 )
 @pytest.mark.skipif(not has_deep_gemm(), reason="DeepGEMM is not available")
